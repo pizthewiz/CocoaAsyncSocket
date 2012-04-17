@@ -3,11 +3,11 @@
 /**
  * Welcome to Cocoa Lumberjack!
  * 
- * The Google Code page has a wealth of documentation if you have any questions.
- * http://code.google.com/p/cocoalumberjack/
+ * The project page has a wealth of documentation if you have any questions.
+ * https://github.com/robbiehanson/CocoaLumberjack
  * 
- * If you're new to the project you may wish to read the "Getting Started" page.
- * http://code.google.com/p/cocoalumberjack/wiki/GettingStarted
+ * If you're new to the project you may wish to read the "Getting Started" wiki.
+ * https://github.com/robbiehanson/CocoaLumberjack/wiki/GettingStarted
  * 
  * Otherwise, here is a quick refresher.
  * There are three steps to using the macros:
@@ -33,100 +33,6 @@
 **/
 
 
-// Can we use Grand Central Dispatch?
-// 
-// This question is actually composed of two parts:
-// 1. Is it available to the compiler?
-// 2. Is it available to the runtime?
-// 
-// For example, if we are building a universal iPad/iPhone app,
-// our base SDK may be iOS 4, but our deployment target would be iOS 3.2.
-// In this case we can compile against the GCD libraries (which are available starting with iOS 4),
-// but we can only use them at runtime if running on iOS 4 or later.
-// If running on an iPad using iOS 3.2, we need to use runtime checks for backwards compatibility.
-// 
-// The solution is to use a combination of compile-time and run-time macros.
-// 
-// Note that when the minimum supported SDK supports GCD
-// the run-time checks will be compiled out during optimization.
-
-#if TARGET_OS_IPHONE
-
-  // Compiling for iPod/iPhone/iPad
-
-  #if __IPHONE_OS_VERSION_MAX_ALLOWED >= 40000 // 4.0 supported
-  
-    #if __IPHONE_OS_VERSION_MIN_REQUIRED >= 40000 // 4.0 supported and required
-
-      #define IS_GCD_AVAILABLE      YES
-      #define GCD_MAYBE_AVAILABLE   1
-      #define GCD_MAYBE_UNAVAILABLE 0
-
-    #else                                         // 4.0 supported but not required
-
-      #ifndef NSFoundationVersionNumber_iPhoneOS_4_0
-        #define NSFoundationVersionNumber_iPhoneOS_4_0 751.32
-      #endif
-
-      #define IS_GCD_AVAILABLE     (NSFoundationVersionNumber >= NSFoundationVersionNumber_iPhoneOS_4_0)
-      #define GCD_MAYBE_AVAILABLE   1
-      #define GCD_MAYBE_UNAVAILABLE 1
-
-    #endif
-
-  #else                                        // 4.0 not supported
-
-    #define IS_GCD_AVAILABLE      NO
-    #define GCD_MAYBE_AVAILABLE   0
-    #define GCD_MAYBE_UNAVAILABLE 1
-
-  #endif
-
-#else
-
-  // Compiling for Mac OS X
-
-  #if MAC_OS_X_VERSION_MAX_ALLOWED >= 1060 // 10.6 supported
-  
-    #if MAC_OS_X_VERSION_MIN_REQUIRED >= 1060 // 10.6 supported and required
-
-      #define IS_GCD_AVAILABLE      YES
-      #define GCD_MAYBE_AVAILABLE   1
-      #define GCD_MAYBE_UNAVAILABLE 0
-
-    #else                                     // 10.6 supported but not required
-
-      #ifndef NSFoundationVersionNumber10_6
-        #define NSFoundationVersionNumber10_6 751.00
-      #endif
-
-      #define IS_GCD_AVAILABLE     (NSFoundationVersionNumber >= NSFoundationVersionNumber10_6)
-      #define GCD_MAYBE_AVAILABLE   1
-      #define GCD_MAYBE_UNAVAILABLE 1
-
-    #endif
-  
-  #else                                    // 10.6 not supported
-
-    #define IS_GCD_AVAILABLE      NO
-    #define GCD_MAYBE_AVAILABLE   0
-    #define GCD_MAYBE_UNAVAILABLE 1
-
-  #endif
-
-#endif
-
-/*
-// Uncomment for quick temporary test to see if it builds for older OS targets
-#undef IS_GCD_AVAILABLE
-#undef GCD_MAYBE_AVAILABLE
-#undef GCD_MAYBE_UNAVAILABLE
-
-#define IS_GCD_AVAILABLE      NO
-#define GCD_MAYBE_AVAILABLE   0
-#define GCD_MAYBE_UNAVAILABLE 1
-*/
-
 @class DDLogMessage;
 
 @protocol DDLogger;
@@ -144,6 +50,7 @@
         file:__FILE__                                             \
     function:fnct                                                 \
         line:__LINE__                                             \
+         tag:nil                                                  \
       format:(frmt), ##__VA_ARGS__]
 
 
@@ -195,11 +102,11 @@
  * 
  * More advanced users may choose to completely customize the levels (and level names) to suite their needs.
  * For more information on this see the "Custom Log Levels" page:
- * http://code.google.com/p/cocoalumberjack/wiki/CustomLogLevels
+ * https://github.com/robbiehanson/CocoaLumberjack/wiki/CustomLogLevels
  * 
  * Advanced users may also notice that we're using a bitmask.
  * This is to allow for custom fine grained logging:
- * http://code.google.com/p/cocoalumberjack/wiki/FineGrainedLogging
+ * https://github.com/robbiehanson/CocoaLumberjack/wiki/FineGrainedLogging
  * 
  * -- Flags --
  * 
@@ -246,7 +153,7 @@
  * Instead, create your own MyLogging.h or ApplicationNameLogging.h or CompanyLogging.h
  * 
  * For an example of customizing your logging experience, see the "Custom Log Levels" page:
- * http://code.google.com/p/cocoalumberjack/wiki/CustomLogLevels
+ * https://github.com/robbiehanson/CocoaLumberjack/wiki/CustomLogLevels
 **/
 
 #define LOG_FLAG_ERROR    (1 << 0)  // 0...0001
@@ -289,9 +196,9 @@
  * For example: DDLogWarn(@"%@: Unable to find thingy", THIS_FILE) -> @"MyViewController: Unable to find thingy"
 **/
 
-NSString *ExtractFileNameWithoutExtension(const char *filePath, BOOL copy);
+NSString *DDExtractFileNameWithoutExtension(const char *filePath, BOOL copy);
 
-#define THIS_FILE (ExtractFileNameWithoutExtension(__FILE__, NO))
+#define THIS_FILE (DDExtractFileNameWithoutExtension(__FILE__, NO))
 
 /**
  * The THIS_METHOD macro gives you the name of the current objective-c method.
@@ -311,27 +218,12 @@ NSString *ExtractFileNameWithoutExtension(const char *filePath, BOOL copy);
 
 @interface DDLog : NSObject
 
-#if GCD_MAYBE_AVAILABLE
-
 /**
  * Provides access to the underlying logging queue.
  * This may be helpful to Logger classes for things like thread synchronization.
 **/
 
 + (dispatch_queue_t)loggingQueue;
-
-#endif
-
-#if GCD_MAYBE_UNAVAILABLE
-
-/**
- * Provides access to the underlying logging thread.
- * This may be helpful to Logger classes for things like thread synchronization.
-**/
-
-+ (NSThread *)loggingThread;
-
-#endif
 
 /**
  * Logging Primitive.
@@ -347,7 +239,25 @@ NSString *ExtractFileNameWithoutExtension(const char *filePath, BOOL copy);
        file:(const char *)file
    function:(const char *)function
        line:(int)line
-     format:(NSString *)format, ...;
+        tag:(id)tag
+     format:(NSString *)format, ... __attribute__ ((format (__NSString__, 9, 10)));
+
+/**
+ * Logging Primitive.
+ * 
+ * This method can be used if you have a prepared va_list.
+ */
++ (void)log:(BOOL)asynchronous
+      level:(int)level
+       flag:(int)flag
+    context:(int)context
+       file:(const char *)file
+   function:(const char *)function
+       line:(int)line
+        tag:(id)tag
+     format:(NSString *)format
+       args:(va_list)argList;
+
 
 /**
  * Since logging can be asynchronous, there may be times when you want to flush the logs.
@@ -431,11 +341,8 @@ NSString *ExtractFileNameWithoutExtension(const char *filePath, BOOL copy);
 **/
 - (void)flush;
 
-#if GCD_MAYBE_AVAILABLE
-
 /**
- * When Grand Central Dispatch is available
- * each logger is executed concurrently with respect to the other loggers.
+ * Each logger is executed concurrently with respect to the other loggers.
  * Thus, a dedicated dispatch queue is used for each logger.
  * Logger implementations may optionally choose to provide their own dispatch queue.
 **/
@@ -448,8 +355,6 @@ NSString *ExtractFileNameWithoutExtension(const char *filePath, BOOL copy);
  * This may be helpful for debugging or profiling reasons.
 **/
 - (NSString *)loggerName;
-
-#endif
 
 @end
 
@@ -466,7 +371,7 @@ NSString *ExtractFileNameWithoutExtension(const char *filePath, BOOL copy);
  * For example, log messages for log files may be formatted differently than log messages for the console.
  * 
  * For more information about formatters, see the "Custom Formatters" page:
- * http://code.google.com/p/cocoalumberjack/wiki/CustomFormatters
+ * https://github.com/robbiehanson/CocoaLumberjack/wiki/CustomFormatters
  * 
  * The formatter may also optionally filter the log message by returning nil,
  * in which case the logger will not log the message.
@@ -534,34 +439,28 @@ NSString *ExtractFileNameWithoutExtension(const char *filePath, BOOL copy);
 	const char *function;
 	int lineNumber;
 	mach_port_t machThreadID;
-#if GCD_MAYBE_AVAILABLE
     char *queueLabel;
-#endif
-
-// The private variables below are only calculated if needed.
-// You should use the public methods to access this information.
-	
-@private
-	NSString *threadID;
-	NSString *fileName;
-	NSString *methodName;
+	NSString *threadName;
+	id tag; // For 3rd party extensions to the framework, where flags and contexts aren't enough.
 }
 
-// The initializer is somewhat reserved for internal use.
-// However, if you find need to manually create logMessage objects,
-// there is one thing you should be aware of.
-// The initializer expects the file and function parameters to be string literals.
-// That is, it expects the given strings to exist for the duration of the object's lifetime,
-// and it expects the given strings to be immutable.
-// In other words, it does not copy these strings, it simply points to them.
-
+/**
+ * The initializer is somewhat reserved for internal use.
+ * However, if you find need to manually create logMessage objects, there is one thing you should be aware of:
+ * 
+ * The initializer expects the file and function parameters to be string literals.
+ * That is, it expects the given strings to exist for the duration of the object's lifetime,
+ * and it expects the given strings to be immutable.
+ * In other words, it does not copy these strings, it simply points to them.
+**/
 - (id)initWithLogMsg:(NSString *)logMsg
                level:(int)logLevel
                 flag:(int)logFlag
              context:(int)logContext
                 file:(const char *)file
             function:(const char *)function
-                line:(int)line;
+                line:(int)line
+                 tag:(id)tag;
 
 /**
  * Returns the threadID as it appears in NSLog.
@@ -570,7 +469,7 @@ NSString *ExtractFileNameWithoutExtension(const char *filePath, BOOL copy);
 - (NSString *)threadID;
 
 /**
- * Convenience method to get just the file name, as the file variable is generally the full file path.
+ * Convenience property to get just the file name, as the file variable is generally the full file path.
  * This method does not include the file extension, which is generally unwanted for logging purposes.
 **/
 - (NSString *)fileName;
@@ -607,9 +506,7 @@ NSString *ExtractFileNameWithoutExtension(const char *filePath, BOOL copy);
 {
 	id <DDLogFormatter> formatter;
 	
-#if GCD_MAYBE_AVAILABLE
 	dispatch_queue_t loggerQueue;
-#endif
 }
 
 - (id <DDLogFormatter>)logFormatter;

@@ -3,10 +3,15 @@
 //  
 //  This class is in the public domain.
 //  Originally created by Robbie Hanson of Deusty LLC.
-//  Updated and maintained by Deusty LLC and the Mac development community.
+//  Updated and maintained by Deusty LLC and the Apple development community.
 //  
-//  http://code.google.com/p/cocoaasyncsocket/
+//  https://github.com/robbiehanson/CocoaAsyncSocket
 //
+
+#if ! __has_feature(objc_arc)
+#warning This file must be compiled with ARC. Use -fobjc-arc flag (or convert project to ARC).
+// For more information see: https://github.com/robbiehanson/CocoaAsyncSocket/wiki/ARC
+#endif
 
 #import "GCDAsyncUdpSocket.h"
 
@@ -89,6 +94,12 @@ static const int logLevel = LOG_LEVEL_VERBOSE;
 **/
 #define SOCKET_NULL -1
 
+/**
+ * Just to type less code.
+**/
+#define AutoreleasedBlock(block) ^{ @autoreleasepool { block(); }} 
+
+
 @class GCDAsyncUdpSendPacket;
 
 NSString *const GCDAsyncUdpSocketException = @"GCDAsyncUdpSocketException";
@@ -100,20 +111,21 @@ enum GCDAsyncUdpSocketFlags
 	kDidBind                 = 1 <<  1,  // If set, bind has been called.
 	kConnecting              = 1 <<  2,  // If set, a connection attempt is in progress.
 	kDidConnect              = 1 <<  3,  // If set, socket is connected.
-	kReceive                 = 1 <<  4,  // If set, receive is enabled
-	kIPv4Deactivated         = 1 <<  5,  // If set, socket4 was closed due to bind or connect on IPv6.
-	kIPv6Deactivated         = 1 <<  6,  // If set, socket6 was closed due to bind or connect on IPv4.
-	kSend4SourceSuspended    = 1 <<  7,  // If set, send4Source is suspended.
-	kSend6SourceSuspended    = 1 <<  8,  // If set, send6Source is suspended.
-	kReceive4SourceSuspended = 1 <<  9,  // If set, receive4Source is suspended.
-	kReceive6SourceSuspended = 1 << 10,  // If set, receive6Source is suspended.
-	kSock4CanAcceptBytes     = 1 << 11,  // If set, we know socket4 can accept bytes. If unset, it's unknown.
-	kSock6CanAcceptBytes     = 1 << 12,  // If set, we know socket6 can accept bytes. If unset, it's unknown.
-	kForbidSendReceive       = 1 << 13,  // If set, no new send or receive operations are allowed to be queued.
-	kCloseAfterSends         = 1 << 14,  // If set, close as soon as no more sends are queued.
-	kFlipFlop                = 1 << 15,  // Used to alternate between IPv4 and IPv6 sockets.
+	kReceiveOnce             = 1 <<  4,  // If set, one-at-a-time receive is enabled
+	kReceiveContinuous       = 1 <<  5,  // If set, continuous receive is enabled
+	kIPv4Deactivated         = 1 <<  6,  // If set, socket4 was closed due to bind or connect on IPv6.
+	kIPv6Deactivated         = 1 <<  7,  // If set, socket6 was closed due to bind or connect on IPv4.
+	kSend4SourceSuspended    = 1 <<  8,  // If set, send4Source is suspended.
+	kSend6SourceSuspended    = 1 <<  9,  // If set, send6Source is suspended.
+	kReceive4SourceSuspended = 1 << 10,  // If set, receive4Source is suspended.
+	kReceive6SourceSuspended = 1 << 11,  // If set, receive6Source is suspended.
+	kSock4CanAcceptBytes     = 1 << 12,  // If set, we know socket4 can accept bytes. If unset, it's unknown.
+	kSock6CanAcceptBytes     = 1 << 13,  // If set, we know socket6 can accept bytes. If unset, it's unknown.
+	kForbidSendReceive       = 1 << 14,  // If set, no new send or receive operations are allowed to be queued.
+	kCloseAfterSends         = 1 << 15,  // If set, close as soon as no more sends are queued.
+	kFlipFlop                = 1 << 16,  // Used to alternate between IPv4 and IPv6 sockets.
 #if TARGET_OS_IPHONE
-	kAddedStreamListener     = 1 << 16,  // If set, CFStreams have been added to listener thread
+	kAddedStreamListener     = 1 << 17,  // If set, CFStreams have been added to listener thread
 #endif
 };
 
@@ -134,8 +146,9 @@ enum GCDAsyncUdpSocketConfig
 	id delegate;
 	dispatch_queue_t delegateQueue;
 	
-	GCDAsyncUdpSocketReceiveFilterBlock filterBlock;
-	dispatch_queue_t filterQueue;
+	GCDAsyncUdpSocketReceiveFilterBlock receiveFilterBlock;
+	dispatch_queue_t receiveFilterQueue;
+	BOOL receiveFilterAsync;
 	
 	uint32_t flags;
 	uint16_t config;
@@ -159,6 +172,8 @@ enum GCDAsyncUdpSocketConfig
 	
 	unsigned long socket4FDBytesAvailable;
 	unsigned long socket6FDBytesAvailable;
+	
+	uint32_t pendingFilterOperations;
 	
 	NSData   *cachedLocalAddress4;
 	NSString *cachedLocalHost4;
@@ -204,6 +219,8 @@ enum GCDAsyncUdpSocketConfig
 
 - (void)closeWithError:(NSError *)error;
 
+- (BOOL)performMulticastRequest:(int)requestType forGroup:(NSString *)group onInterface:(NSString *)interface error:(NSError **)errPtr;
+
 #if TARGET_OS_IPHONE
 - (BOOL)createReadAndWriteStreams:(NSError **)errPtr;
 - (BOOL)registerForStreamCallbacks:(NSError **)errPtr;
@@ -217,6 +234,11 @@ enum GCDAsyncUdpSocketConfig
 + (NSString *)hostFromSockaddr6:(const struct sockaddr_in6 *)pSockaddr6;
 + (uint16_t)portFromSockaddr4:(const struct sockaddr_in *)pSockaddr4;
 + (uint16_t)portFromSockaddr6:(const struct sockaddr_in6 *)pSockaddr6;
+
+#if TARGET_OS_IPHONE
+// Forward declaration
++ (void)listenerThread;
+#endif
 
 @end
 
@@ -249,7 +271,7 @@ enum GCDAsyncUdpSocketConfig
 {
 	if ((self = [super init]))
 	{
-		buffer = [d retain];
+		buffer = d;
 		timeout = t;
 		tag = i;
 		
@@ -258,13 +280,6 @@ enum GCDAsyncUdpSocketConfig
 	return self;
 }
 
-- (void)dealloc
-{
-	[buffer release];
-	[addresses release];
-	[error release];
-	[super dealloc];
-}
 
 @end
 
@@ -294,12 +309,6 @@ enum GCDAsyncUdpSocketConfig
 	return self;
 }
 
-- (void)dealloc
-{
-	[addresses release];
-	[error release];
-	[super dealloc];
-}
 
 @end
 
@@ -408,12 +417,7 @@ enum GCDAsyncUdpSocketConfig
 		dispatch_release(socketQueue);
 	socketQueue = NULL;
 	
-	[sendQueue release];
-	[userData release];
-	
 	LogInfo(@"%@ - %@ (finish)", THIS_METHOD, self);
-	
-	[super dealloc];
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -823,7 +827,7 @@ enum GCDAsyncUdpSocketConfig
 	
 	dispatch_block_t block = ^{
 		
-		result = [userData retain];
+		result = userData;
 	};
 	
 	if (dispatch_get_current_queue() == socketQueue)
@@ -831,7 +835,7 @@ enum GCDAsyncUdpSocketConfig
 	else
 		dispatch_sync(socketQueue, block);
 	
-	return [result autorelease];
+	return result;
 }
 
 - (void)setUserData:(id)arbitraryUserData
@@ -840,8 +844,7 @@ enum GCDAsyncUdpSocketConfig
 		
 		if (userData != arbitraryUserData)
 		{
-			[userData release];
-			userData = [arbitraryUserData retain];
+			userData = arbitraryUserData;
 		}
 	};
 	
@@ -862,7 +865,7 @@ enum GCDAsyncUdpSocketConfig
 	if (delegateQueue && [delegate respondsToSelector:@selector(udpSocket:didConnectToAddress:)])
 	{
 		id theDelegate = delegate;
-		NSData *address = [[anAddress copy] autorelease]; // In case param is NSMutableData
+		NSData *address = [anAddress copy]; // In case param is NSMutableData
 		
 		dispatch_async(delegateQueue, ^{ @autoreleasepool {
 			
@@ -1095,7 +1098,7 @@ enum GCDAsyncUdpSocketConfig
 	// So we want to copy it now, within this block that will be executed synchronously.
 	// This way the asynchronous lookup block below doesn't have to worry about it changing.
 	
-	NSString *host = [[aHost copy] autorelease];
+	NSString *host = [aHost copy];
 	
 	
 	dispatch_queue_t globalConcurrentQueue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
@@ -1220,7 +1223,10 @@ enum GCDAsyncUdpSocketConfig
 		NSString *msg = @"IPv4 has been disabled and DNS lookup found no IPv6 address(es).";
 		resultError = [self otherError:msg];
 		
-		goto SetParamPtrsAndReturn;
+		if (addressPtr) *addressPtr = resultAddress;
+		if (errorPtr) *errorPtr = resultError;
+		
+		return resultAF;
 	}
 	
 	if (isIPv6Disabled && !resolvedIPv4Address)
@@ -1228,7 +1234,10 @@ enum GCDAsyncUdpSocketConfig
 		NSString *msg = @"IPv6 has been disabled and DNS lookup found no IPv4 address(es).";
 		resultError = [self otherError:msg];
 		
-		goto SetParamPtrsAndReturn;
+		if (addressPtr) *addressPtr = resultAddress;
+		if (errorPtr) *errorPtr = resultError;
+		
+		return resultAF;
 	}
 	
 	BOOL isIPv4Deactivated = (flags & kIPv4Deactivated) ? YES : NO;
@@ -1239,7 +1248,10 @@ enum GCDAsyncUdpSocketConfig
 		NSString *msg = @"IPv4 has been deactivated due to bind/connect, and DNS lookup found no IPv6 address(es).";
 		resultError = [self otherError:msg];
 		
-		goto SetParamPtrsAndReturn;
+		if (addressPtr) *addressPtr = resultAddress;
+		if (errorPtr) *errorPtr = resultError;
+		
+		return resultAF;
 	}
 	
 	if (isIPv6Deactivated && !resolvedIPv4Address)
@@ -1247,7 +1259,10 @@ enum GCDAsyncUdpSocketConfig
 		NSString *msg = @"IPv6 has been deactivated due to bind/connect, and DNS lookup found no IPv4 address(es).";
 		resultError = [self otherError:msg];
 		
-		goto SetParamPtrsAndReturn;
+		if (addressPtr) *addressPtr = resultAddress;
+		if (errorPtr) *errorPtr = resultError;
+		
+		return resultAF;
 	}
 	
 	// Extract first IPv4 and IPv6 address in list
@@ -1308,16 +1323,8 @@ enum GCDAsyncUdpSocketConfig
 		resultAddress = address6;
 	}
 	
-	goto SetParamPtrsAndReturn;
-	
-	
-SetParamPtrsAndReturn:
-	
-	if (addressPtr)
-		*addressPtr = [[resultAddress retain] autorelease];
-	
-	if (errorPtr)
-		*errorPtr = resultError;
+	if (addressPtr) *addressPtr = resultAddress;
+	if (errorPtr) *errorPtr = resultError;
 		
 	return resultAF;
 }
@@ -2055,8 +2062,6 @@ SetParamPtrsAndReturn:
 		
 		// Clear cached info
 		
-		[cachedLocalAddress4 release];
-		[cachedLocalHost4 release];
 		
 		cachedLocalAddress4 = nil;
 		cachedLocalHost4 = nil;
@@ -2096,8 +2101,6 @@ SetParamPtrsAndReturn:
 		
 		// Clear cached info
 		
-		[cachedLocalAddress6 release];
-		[cachedLocalHost6 release];
 		
 		cachedLocalAddress6 = nil;
 		cachedLocalHost6 = nil;
@@ -2177,21 +2180,16 @@ SetParamPtrsAndReturn:
 		return;
 	}
 	
-	@autoreleasepool {
+	NSData *address = nil;
+	NSString *host = nil;
+	uint16_t port = 0;
 	
-		NSData *address = nil;
-		NSString *host = nil;
-		uint16_t port = 0;
+	if ([self getLocalAddress:&address host:&host port:&port forSocket:socket4FD withFamily:AF_INET])
+	{
 		
-		if ([self getLocalAddress:&address host:&host port:&port forSocket:socket4FD withFamily:AF_INET])
-		{
-			[cachedLocalAddress4 release];
-			[cachedLocalHost4 release];
-			
-			cachedLocalAddress4 = [address retain];
-			cachedLocalHost4 = [host retain];
-			cachedLocalPort4 = port;
-		}
+		cachedLocalAddress4 = address;
+		cachedLocalHost4 = host;
+		cachedLocalPort4 = port;
 	}
 }
 
@@ -2204,21 +2202,16 @@ SetParamPtrsAndReturn:
 		return;
 	}
 	
-	@autoreleasepool {
+	NSData *address = nil;
+	NSString *host = nil;
+	uint16_t port = 0;
 	
-		NSData *address = nil;
-		NSString *host = nil;
-		uint16_t port = 0;
+	if ([self getLocalAddress:&address host:&host port:&port forSocket:socket6FD withFamily:AF_INET6])
+	{
 		
-		if ([self getLocalAddress:&address host:&host port:&port forSocket:socket6FD withFamily:AF_INET6])
-		{
-			[cachedLocalAddress6 release];
-			[cachedLocalHost6 release];
-			
-			cachedLocalAddress6 = [address retain];
-			cachedLocalHost6 = [host retain];
-			cachedLocalPort6 = port;
-		}
+		cachedLocalAddress6 = address;
+		cachedLocalHost6 = host;
+		cachedLocalPort6 = port;
 	}
 }
 
@@ -2226,42 +2219,53 @@ SetParamPtrsAndReturn:
 {
 	__block NSData *result = nil;
 	
-	dispatch_block_t block = ^{ @autoreleasepool {
+	dispatch_block_t block = ^{
 		
 		if (socket4FD != SOCKET_NULL)
-			result = [[self localAddress_IPv4] retain];
+		{
+			[self maybeUpdateCachedLocalAddress4Info];
+			result = cachedLocalAddress4;
+		}
 		else
-			result = [[self localAddress_IPv6] retain];
+		{
+			[self maybeUpdateCachedLocalAddress6Info];
+			result = cachedLocalAddress6;
+		}
 		
-	}};
+	};
 	
 	if (dispatch_get_current_queue() == socketQueue)
 		block();
 	else
-		dispatch_sync(socketQueue, block);
+		dispatch_sync(socketQueue, AutoreleasedBlock(block));
 	
-	return [result autorelease];
+	return result;
 }
 
 - (NSString *)localHost
 {
 	__block NSString *result = nil;
 	
-	dispatch_block_t block = ^{ @autoreleasepool {
+	dispatch_block_t block = ^{
 		
 		if (socket4FD != SOCKET_NULL)
-			result = [[self localHost_IPv4] retain];
+		{
+			[self maybeUpdateCachedLocalAddress4Info];
+			result = cachedLocalHost4;
+		}
 		else
-			result = [[self localHost_IPv6] retain];
-		
-	}};
+		{
+			[self maybeUpdateCachedLocalAddress6Info];
+			result = cachedLocalHost6;
+		}
+	};
 	
 	if (dispatch_get_current_queue() == socketQueue)
 		block();
 	else
-		dispatch_sync(socketQueue, block);
+		dispatch_sync(socketQueue, AutoreleasedBlock(block));
 	
-	return [result autorelease];
+	return result;
 }
 
 - (uint16_t)localPort
@@ -2271,15 +2275,21 @@ SetParamPtrsAndReturn:
 	dispatch_block_t block = ^{
 		
 		if (socket4FD != SOCKET_NULL)
-			result = [self localPort_IPv4];
+		{
+			[self maybeUpdateCachedLocalAddress4Info];
+			result = cachedLocalPort4;
+		}
 		else
-			result = [self localPort_IPv6];
+		{
+			[self maybeUpdateCachedLocalAddress6Info];
+			result = cachedLocalPort6;
+		}
 	};
 	
 	if (dispatch_get_current_queue() == socketQueue)
 		block();
 	else
-		dispatch_sync(socketQueue, block);
+		dispatch_sync(socketQueue, AutoreleasedBlock(block));
 	
 	return result;
 }
@@ -2291,15 +2301,15 @@ SetParamPtrsAndReturn:
 	dispatch_block_t block = ^{
 		
 		[self maybeUpdateCachedLocalAddress4Info];
-		result = [cachedLocalAddress4 retain];
+		result = cachedLocalAddress4;
 	};
 	
 	if (dispatch_get_current_queue() == socketQueue)
 		block();
 	else
-		dispatch_sync(socketQueue, block);
+		dispatch_sync(socketQueue, AutoreleasedBlock(block));
 	
-	return [result autorelease];
+	return result;
 }
 
 - (NSString *)localHost_IPv4
@@ -2309,15 +2319,15 @@ SetParamPtrsAndReturn:
 	dispatch_block_t block = ^{
 		
 		[self maybeUpdateCachedLocalAddress4Info];
-		result = [cachedLocalHost4 retain];
+		result = cachedLocalHost4;
 	};
 	
 	if (dispatch_get_current_queue() == socketQueue)
 		block();
 	else
-		dispatch_sync(socketQueue, block);
+		dispatch_sync(socketQueue, AutoreleasedBlock(block));
 	
-	return [result autorelease];
+	return result;
 }
 
 - (uint16_t)localPort_IPv4
@@ -2333,7 +2343,7 @@ SetParamPtrsAndReturn:
 	if (dispatch_get_current_queue() == socketQueue)
 		block();
 	else
-		dispatch_sync(socketQueue, block);
+		dispatch_sync(socketQueue, AutoreleasedBlock(block));
 	
 	return result;
 }
@@ -2345,15 +2355,15 @@ SetParamPtrsAndReturn:
 	dispatch_block_t block = ^{
 		
 		[self maybeUpdateCachedLocalAddress6Info];
-		result = [cachedLocalAddress6 retain];
+		result = cachedLocalAddress6;
 	};
 	
 	if (dispatch_get_current_queue() == socketQueue)
 		block();
 	else
-		dispatch_sync(socketQueue, block);
+		dispatch_sync(socketQueue, AutoreleasedBlock(block));
 	
-	return [result autorelease];
+	return result;
 }
 
 - (NSString *)localHost_IPv6
@@ -2363,15 +2373,15 @@ SetParamPtrsAndReturn:
 	dispatch_block_t block = ^{
 		
 		[self maybeUpdateCachedLocalAddress6Info];
-		result = [cachedLocalHost6 retain];
+		result = cachedLocalHost6;
 	};
 	
 	if (dispatch_get_current_queue() == socketQueue)
 		block();
 	else
-		dispatch_sync(socketQueue, block);
+		dispatch_sync(socketQueue, AutoreleasedBlock(block));
 	
-	return [result autorelease];
+	return result;
 }
 
 - (uint16_t)localPort_IPv6
@@ -2387,7 +2397,7 @@ SetParamPtrsAndReturn:
 	if (dispatch_get_current_queue() == socketQueue)
 		block();
 	else
-		dispatch_sync(socketQueue, block);
+		dispatch_sync(socketQueue, AutoreleasedBlock(block));
 	
 	return result;
 }
@@ -2401,56 +2411,51 @@ SetParamPtrsAndReturn:
 		return;
 	}
 	
-	@autoreleasepool {
+	NSData *data = nil;
+	NSString *host = nil;
+	uint16_t port = 0;
+	int family = AF_UNSPEC;
 	
-		NSData *data = nil;
-		NSString *host = nil;
-		uint16_t port = 0;
-		int family = AF_UNSPEC;
+	if (socket4FD != SOCKET_NULL)
+	{
+		struct sockaddr_in sockaddr4;
+		socklen_t sockaddr4len = sizeof(sockaddr4);
 		
-		if (socket4FD != SOCKET_NULL)
+		if (getpeername(socket4FD, (struct sockaddr *)&sockaddr4, &sockaddr4len) == 0)
 		{
-			struct sockaddr_in sockaddr4;
-			socklen_t sockaddr4len = sizeof(sockaddr4);
-			
-			if (getpeername(socket4FD, (struct sockaddr *)&sockaddr4, &sockaddr4len) == 0)
-			{
-				data = [NSData dataWithBytes:&sockaddr4 length:sockaddr4len];
-				host = [[self class] hostFromSockaddr4:&sockaddr4];
-				port = [[self class] portFromSockaddr4:&sockaddr4];
-				family = AF_INET;
-			}
-			else
-			{
-				LogWarn(@"Error in getpeername: %@", [self errnoError]);
-			}
+			data = [NSData dataWithBytes:&sockaddr4 length:sockaddr4len];
+			host = [[self class] hostFromSockaddr4:&sockaddr4];
+			port = [[self class] portFromSockaddr4:&sockaddr4];
+			family = AF_INET;
 		}
-		else if (socket6FD != SOCKET_NULL)
+		else
 		{
-			struct sockaddr_in6 sockaddr6;
-			socklen_t sockaddr6len = sizeof(sockaddr6);
-			
-			if (getpeername(socket6FD, (struct sockaddr *)&sockaddr6, &sockaddr6len) == 0)
-			{
-				data = [NSData dataWithBytes:&sockaddr6 length:sockaddr6len];
-				host = [[self class] hostFromSockaddr6:&sockaddr6];
-				port = [[self class] portFromSockaddr6:&sockaddr6];
-				family = AF_INET6;
-			}
-			else
-			{
-				LogWarn(@"Error in getpeername: %@", [self errnoError]);
-			}
+			LogWarn(@"Error in getpeername: %@", [self errnoError]);
 		}
-		
-		[cachedConnectedAddress release];
-		[cachedConnectedHost release];
-		
-		cachedConnectedAddress = [data retain];
-		cachedConnectedHost    = [host retain];
-		cachedConnectedPort    = port;
-		cachedConnectedFamily  = family;
 	}
+	else if (socket6FD != SOCKET_NULL)
+	{
+		struct sockaddr_in6 sockaddr6;
+		socklen_t sockaddr6len = sizeof(sockaddr6);
+		
+		if (getpeername(socket6FD, (struct sockaddr *)&sockaddr6, &sockaddr6len) == 0)
+		{
+			data = [NSData dataWithBytes:&sockaddr6 length:sockaddr6len];
+			host = [[self class] hostFromSockaddr6:&sockaddr6];
+			port = [[self class] portFromSockaddr6:&sockaddr6];
+			family = AF_INET6;
+		}
+		else
+		{
+			LogWarn(@"Error in getpeername: %@", [self errnoError]);
+		}
+	}
+	
+	
+	cachedConnectedAddress = data;
+	cachedConnectedHost    = host;
+	cachedConnectedPort    = port;
+	cachedConnectedFamily  = family;
 }
 
 - (NSData *)connectedAddress
@@ -2460,15 +2465,15 @@ SetParamPtrsAndReturn:
 	dispatch_block_t block = ^{
 		
 		[self maybeUpdateCachedConnectedAddressInfo];
-		result = [cachedConnectedAddress retain];
+		result = cachedConnectedAddress;
 	};
 	
 	if (dispatch_get_current_queue() == socketQueue)
 		block();
 	else
-		dispatch_sync(socketQueue, block);
+		dispatch_sync(socketQueue, AutoreleasedBlock(block));
 	
-	return [result autorelease];
+	return result;
 }
 
 - (NSString *)connectedHost
@@ -2478,15 +2483,15 @@ SetParamPtrsAndReturn:
 	dispatch_block_t block = ^{
 		
 		[self maybeUpdateCachedConnectedAddressInfo];
-		result = [cachedConnectedHost retain];
+		result = cachedConnectedHost;
 	};
 	
 	if (dispatch_get_current_queue() == socketQueue)
 		block();
 	else
-		dispatch_sync(socketQueue, block);
+		dispatch_sync(socketQueue, AutoreleasedBlock(block));
 	
-	return [result autorelease];
+	return result;
 }
 
 - (uint16_t)connectedPort
@@ -2502,7 +2507,7 @@ SetParamPtrsAndReturn:
 	if (dispatch_get_current_queue() == socketQueue)
 		block();
 	else
-		dispatch_sync(socketQueue, block);
+		dispatch_sync(socketQueue, AutoreleasedBlock(block));
 	
 	return result;
 }
@@ -2655,7 +2660,6 @@ SetParamPtrsAndReturn:
 		
 		if (![self preBind:&err])
 		{
-			[err retain];
 			return_from_block;
 		}
 		
@@ -2669,7 +2673,7 @@ SetParamPtrsAndReturn:
 		if ((interface4 == nil) && (interface6 == nil))
 		{
 			NSString *msg = @"Unknown interface. Specify valid interface by name (e.g. \"en1\") or IP address.";
-			err = [[self badParamError:msg] retain];
+			err = [self badParamError:msg];
 			
 			return_from_block;
 		}
@@ -2680,7 +2684,7 @@ SetParamPtrsAndReturn:
 		if (isIPv4Disabled && (interface6 == nil))
 		{
 			NSString *msg = @"IPv4 has been disabled and specified interface doesn't support IPv6.";
-			err = [[self badParamError:msg] retain];
+			err = [self badParamError:msg];
 			
 			return_from_block;
 		}
@@ -2688,7 +2692,7 @@ SetParamPtrsAndReturn:
 		if (isIPv6Disabled && (interface4 == nil))
 		{
 			NSString *msg = @"IPv6 has been disabled and specified interface doesn't support IPv4.";
-			err = [[self badParamError:msg] retain];
+			err = [self badParamError:msg];
 			
 			return_from_block;
 		}
@@ -2704,7 +2708,6 @@ SetParamPtrsAndReturn:
 		{
 			if (![self createSocket4:useIPv4 socket6:useIPv6 error:&err])
 			{
-				[err retain];
 				return_from_block;
 			}
 		}
@@ -2721,7 +2724,7 @@ SetParamPtrsAndReturn:
 				[self closeSockets];
 				
 				NSString *reason = @"Error in bind() function";
-				err = [[self errnoErrorWithReason:reason] retain];
+				err = [self errnoErrorWithReason:reason];
 				
 				return_from_block;
 			}
@@ -2735,7 +2738,7 @@ SetParamPtrsAndReturn:
 				[self closeSockets];
 				
 				NSString *reason = @"Error in bind() function";
-				err = [[self errnoErrorWithReason:reason] retain];
+				err = [self errnoErrorWithReason:reason];
 				
 				return_from_block;
 			}
@@ -2761,9 +2764,7 @@ SetParamPtrsAndReturn:
 		LogError(@"Error binding to port/interface: %@", err);
 	
 	if (errPtr)
-		*errPtr = [err autorelease];
-	else
-		[err release];
+		*errPtr = err;
 	
 	return result;
 }
@@ -2779,7 +2780,6 @@ SetParamPtrsAndReturn:
 		
 		if (![self preBind:&err])
 		{
-			[err retain];
 			return_from_block;
 		}
 		
@@ -2790,7 +2790,7 @@ SetParamPtrsAndReturn:
 		if (addressFamily == AF_UNSPEC)
 		{
 			NSString *msg = @"A valid IPv4 or IPv6 address was not given";
-			err = [[self badParamError:msg] retain];
+			err = [self badParamError:msg];
 			
 			return_from_block;
 		}
@@ -2804,7 +2804,7 @@ SetParamPtrsAndReturn:
 		if (isIPv4Disabled && localAddr4)
 		{
 			NSString *msg = @"IPv4 has been disabled and an IPv4 address was passed.";
-			err = [[self badParamError:msg] retain];
+			err = [self badParamError:msg];
 			
 			return_from_block;
 		}
@@ -2812,7 +2812,7 @@ SetParamPtrsAndReturn:
 		if (isIPv6Disabled && localAddr6)
 		{
 			NSString *msg = @"IPv6 has been disabled and an IPv6 address was passed.";
-			err = [[self badParamError:msg] retain];
+			err = [self badParamError:msg];
 			
 			return_from_block;
 		}
@@ -2828,7 +2828,6 @@ SetParamPtrsAndReturn:
 		{
 			if (![self createSocket4:useIPv4 socket6:useIPv6 error:&err])
 			{
-				[err retain];
 				return_from_block;
 			}
 		}
@@ -2847,7 +2846,7 @@ SetParamPtrsAndReturn:
 				[self closeSockets];
 				
 				NSString *reason = @"Error in bind() function";
-				err = [[self errnoErrorWithReason:reason] retain];
+				err = [self errnoErrorWithReason:reason];
 				
 				return_from_block;
 			}
@@ -2864,7 +2863,7 @@ SetParamPtrsAndReturn:
 				[self closeSockets];
 				
 				NSString *reason = @"Error in bind() function";
-				err = [[self errnoErrorWithReason:reason] retain];
+				err = [self errnoErrorWithReason:reason];
 				
 				return_from_block;
 			}
@@ -2890,9 +2889,7 @@ SetParamPtrsAndReturn:
 		LogError(@"Error binding to address: %@", err);
 	
 	if (errPtr)
-		*errPtr = [err autorelease];
-	else
-		[err release];
+		*errPtr = err;
 	
 	return result;
 }
@@ -2949,7 +2946,6 @@ SetParamPtrsAndReturn:
 		
 		if (![self preConnect:&err])
 		{
-			[err retain];
 			return_from_block;
 		}
 		
@@ -2958,7 +2954,7 @@ SetParamPtrsAndReturn:
 		if (host == nil)
 		{
 			NSString *msg = @"The host param is nil. Should be domain name or IP address string.";
-			err = [[self badParamError:msg] retain];
+			err = [self badParamError:msg];
 			
 			return_from_block;
 		}
@@ -2969,14 +2965,13 @@ SetParamPtrsAndReturn:
 		{
 			if (![self createSockets:&err])
 			{
-				[err retain];
 				return_from_block;
 			}
 		}
 		
 		// Create special connect packet
 		
-		GCDAsyncUdpSpecialPacket *packet = [[[GCDAsyncUdpSpecialPacket alloc] init] autorelease];
+		GCDAsyncUdpSpecialPacket *packet = [[GCDAsyncUdpSpecialPacket alloc] init];
 		packet->resolveInProgress = YES;
 		
 		// Start asynchronous DNS resolve for host:port on background queue
@@ -2991,8 +2986,8 @@ SetParamPtrsAndReturn:
 			
 			packet->resolveInProgress = NO;
 			
-			packet->addresses = [addresses retain];
-			packet->error = [error retain];
+			packet->addresses = addresses;
+			packet->error = error;
 			
 			[self maybeConnect];
 		}];
@@ -3016,9 +3011,7 @@ SetParamPtrsAndReturn:
 		LogError(@"Error connecting to host/port: %@", err);
 	
 	if (errPtr)
-		*errPtr = [err autorelease];
-	else
-		[err release];
+		*errPtr = err;
 	
 	return result;
 }
@@ -3034,7 +3027,6 @@ SetParamPtrsAndReturn:
 		
 		if (![self preConnect:&err])
 		{
-			[err retain];
 			return_from_block;
 		}
 		
@@ -3043,7 +3035,7 @@ SetParamPtrsAndReturn:
 		if (remoteAddr == nil)
 		{
 			NSString *msg = @"The address param is nil. Should be a valid address.";
-			err = [[self badParamError:msg] retain];
+			err = [self badParamError:msg];
 			
 			return_from_block;
 		}
@@ -3054,7 +3046,6 @@ SetParamPtrsAndReturn:
 		{
 			if (![self createSockets:&err])
 			{
-				[err retain];
 				return_from_block;
 			}
 		}
@@ -3062,11 +3053,11 @@ SetParamPtrsAndReturn:
 		// The remoteAddr parameter could be of type NSMutableData.
 		// So we copy it to be safe.
 		
-		NSData *address = [[remoteAddr copy] autorelease];
+		NSData *address = [remoteAddr copy];
 		NSArray *addresses = [NSArray arrayWithObject:address];
 		
-		GCDAsyncUdpSpecialPacket *packet = [[[GCDAsyncUdpSpecialPacket alloc] init] autorelease];
-		packet->addresses = [addresses retain];
+		GCDAsyncUdpSpecialPacket *packet = [[GCDAsyncUdpSpecialPacket alloc] init];
+		packet->addresses = addresses;
 		
 		// Updates flags, add connect packet to send queue, and pump send queue
 		
@@ -3087,9 +3078,7 @@ SetParamPtrsAndReturn:
 		LogError(@"Error connecting to address: %@", err);
 	
 	if (errPtr)
-		*errPtr = [err autorelease];
-	else
-		[err release];
+		*errPtr = err;
 	
 	return result;
 }
@@ -3138,11 +3127,8 @@ SetParamPtrsAndReturn:
 					flags |= kDidBind;
 					flags |= kDidConnect;
 					
-					[cachedConnectedAddress release];
-					[cachedConnectedHost release];
-					
-					cachedConnectedAddress = [address retain];
-					cachedConnectedHost = [[[self class] hostFromAddress:address] retain];
+					cachedConnectedAddress = address;
+					cachedConnectedHost = [[self class] hostFromAddress:address];
 					cachedConnectedPort = [[self class] portFromAddress:address];
 					cachedConnectedFamily = addressFamily;
 					
@@ -3243,6 +3229,26 @@ SetParamPtrsAndReturn:
 
 - (BOOL)joinMulticastGroup:(NSString *)group onInterface:(NSString *)interface error:(NSError **)errPtr
 {
+    // IP_ADD_MEMBERSHIP == IPV6_JOIN_GROUP
+    return [self performMulticastRequest:IP_ADD_MEMBERSHIP forGroup:group onInterface:interface error:errPtr];
+}
+
+- (BOOL)leaveMulticastGroup:(NSString *)group error:(NSError **)errPtr
+{
+	return [self leaveMulticastGroup:group onInterface:nil error:errPtr];
+}
+
+- (BOOL)leaveMulticastGroup:(NSString *)group onInterface:(NSString *)interface error:(NSError **)errPtr
+{
+    // IP_DROP_MEMBERSHIP == IPV6_LEAVE_GROUP
+    return [self performMulticastRequest:IP_DROP_MEMBERSHIP forGroup:group onInterface:interface error:errPtr];
+}
+
+- (BOOL)performMulticastRequest:(int)requestType
+                       forGroup:(NSString *)group
+                    onInterface:(NSString *)interface
+                          error:(NSError **)errPtr
+{
 	__block BOOL result = NO;
 	__block NSError *err = nil;
 	
@@ -3252,7 +3258,6 @@ SetParamPtrsAndReturn:
 		
 		if (![self preJoin:&err])
 		{
-			[err retain];
 			return_from_block;
 		}
 		
@@ -3266,7 +3271,7 @@ SetParamPtrsAndReturn:
 		if ((groupAddr4 == nil) && (groupAddr6 == nil))
 		{
 			NSString *msg = @"Unknown group. Specify valid group IP address.";
-			err = [[self badParamError:msg] retain];
+			err = [self badParamError:msg];
 			
 			return_from_block;
 		}
@@ -3281,7 +3286,7 @@ SetParamPtrsAndReturn:
 		if ((interfaceAddr4 == nil) && (interfaceAddr6 == nil))
 		{
 			NSString *msg = @"Unknown interface. Specify valid interface by name (e.g. \"en1\") or IP address.";
-			err = [[self badParamError:msg] retain];
+			err = [self badParamError:msg];
 			
 			return_from_block;
 		}
@@ -3297,10 +3302,10 @@ SetParamPtrsAndReturn:
 			imreq.imr_multiaddr = nativeGroup->sin_addr;
 			imreq.imr_interface = nativeIface->sin_addr;
 			
-			int status = setsockopt(socket4FD, IPPROTO_IP, IP_ADD_MEMBERSHIP, (const void *)&imreq, sizeof(imreq));
+			int status = setsockopt(socket4FD, IPPROTO_IP, requestType, (const void *)&imreq, sizeof(imreq));
 			if (status != 0)
 			{
-				err = [[self errnoErrorWithReason:@"Error in setsockopt() function"] retain];
+				err = [self errnoErrorWithReason:@"Error in setsockopt() function"];
 				
 				return_from_block;
 			}
@@ -3310,8 +3315,7 @@ SetParamPtrsAndReturn:
 			
 			result = YES;
 		}
-		
-		if ((socket6FD != SOCKET_NULL) && groupAddr6 && interfaceAddr6)
+		else if ((socket6FD != SOCKET_NULL) && groupAddr6 && interfaceAddr6)
 		{
 			const struct sockaddr_in6 *nativeGroup = (struct sockaddr_in6 *)[groupAddr6 bytes];
 			
@@ -3319,10 +3323,10 @@ SetParamPtrsAndReturn:
 			imreq.ipv6mr_multiaddr = nativeGroup->sin6_addr;
 			imreq.ipv6mr_interface = [self indexOfInterfaceAddr6:interfaceAddr6];
 			
-			int status = setsockopt(socket6FD, IPPROTO_IP, IPV6_JOIN_GROUP, (const void *)&imreq, sizeof(imreq));
+			int status = setsockopt(socket6FD, IPPROTO_IP, requestType, (const void *)&imreq, sizeof(imreq));
 			if (status != 0)
 			{
-				err = [[self errnoErrorWithReason:@"Error in setsockopt() function"] retain];
+				err = [self errnoErrorWithReason:@"Error in setsockopt() function"];
 				
 				return_from_block;
 			}
@@ -3331,6 +3335,13 @@ SetParamPtrsAndReturn:
 			[self closeSocket4];
 			
 			result = YES;
+		}
+		else
+		{
+			NSString *msg = @"Socket, group, and interface do not have matching IP versions";
+			err = [self badParamError:msg];
+			
+			return_from_block;
 		}
 		
 	}};
@@ -3341,9 +3352,7 @@ SetParamPtrsAndReturn:
 		dispatch_sync(socketQueue, block);
 	
 	if (errPtr)
-		*errPtr = [err autorelease];
-	else
-		[err release];
+		*errPtr = err;
 	
 	return result;
 }
@@ -3361,7 +3370,6 @@ SetParamPtrsAndReturn:
 		
 		if (![self preOp:&err])
 		{
-			[err retain];
 			return_from_block;
 		}
 		
@@ -3369,7 +3377,6 @@ SetParamPtrsAndReturn:
 		{
 			if (![self createSockets:&err])
 			{
-				[err retain];
 				return_from_block;
 			}
 		}
@@ -3381,7 +3388,7 @@ SetParamPtrsAndReturn:
 			
 			if (error)
 			{
-				err = [[self errnoErrorWithReason:@"Error in setsockopt() function"] retain];
+				err = [self errnoErrorWithReason:@"Error in setsockopt() function"];
 				
 				return_from_block;
 			}
@@ -3399,9 +3406,7 @@ SetParamPtrsAndReturn:
 		dispatch_sync(socketQueue, block);
 	
 	if (errPtr)
-		*errPtr = [err autorelease];
-	else
-		[err release];
+		*errPtr = err;
 	
 	return result;
 }
@@ -3434,7 +3439,6 @@ SetParamPtrsAndReturn:
 		
 	}});
 	
-	[packet release];
 }
 
 - (void)sendData:(NSData *)data
@@ -3462,8 +3466,8 @@ SetParamPtrsAndReturn:
 		
 		packet->resolveInProgress = NO;
 		
-		packet->addresses = [addresses retain];
-		packet->error = [error retain];
+		packet->addresses = addresses;
+		packet->error = error;
 		
 		if (packet == currentSend)
 		{
@@ -3479,7 +3483,6 @@ SetParamPtrsAndReturn:
 		
 	}});
 	
-	[packet release];
 }
 
 - (void)sendData:(NSData *)data toAddress:(NSData *)remoteAddr withTimeout:(NSTimeInterval)timeout tag:(long)tag
@@ -3499,10 +3502,7 @@ SetParamPtrsAndReturn:
 		
 		[sendQueue addObject:packet];
 		[self maybeDequeueSend];
-		
 	}});
-	
-	[packet release];
 }
 
 - (void)maybeDequeueSend
@@ -3527,7 +3527,7 @@ SetParamPtrsAndReturn:
 		while ([sendQueue count] > 0)
 		{
 			// Dequeue the next object in the queue
-			currentSend = [[sendQueue objectAtIndex:0] retain];
+			currentSend = [sendQueue objectAtIndex:0];
 			[sendQueue removeObjectAtIndex:0];
 			
 			if ([currentSend isKindOfClass:[GCDAsyncUdpSpecialPacket class]])
@@ -3542,7 +3542,6 @@ SetParamPtrsAndReturn:
 				[self notifyDidNotSendDataWithTag:currentSend->tag dueToError:currentSend->error];
 				
 				// Clear currentSend
-				[currentSend release];
 				currentSend = nil;
 				
 				continue;
@@ -3590,18 +3589,17 @@ SetParamPtrsAndReturn:
 		return;
 	}
 	
-	ssize_t result = 0;
+	NSData *addr = nil;
+	int af;
+	
+	// 1. Check for problems
 	
 	BOOL waitingForResolve = NO;
-	BOOL waitingForSocket = NO;
-	BOOL checkResult = NO;
 	BOOL done = NO;
 	
 	if (flags & kDidConnect)
 	{
-		// 
 		// Connected socket
-		// 
 		
 		if (currentSend->resolveInProgress || currentSend->addresses || currentSend->error)
 		{
@@ -3613,24 +3611,13 @@ SetParamPtrsAndReturn:
 		}
 		else
 		{
-			const void *buffer = [currentSend->buffer bytes];
-			size_t length = (size_t)[currentSend->buffer length];
-			
-			if (socket4FD != SOCKET_NULL)
-				result = send(socket4FD, buffer, length, 0);
-			else
-				result = send(socket6FD, buffer, length, 0);
-				
-			LogVerbose(@"send(socket%@FD) = %i (connected)", (socket4FD != SOCKET_NULL ? @"4" : @"6"), (int)result);
-			
-			checkResult = YES;
+			af = cachedConnectedFamily;
+			addr = cachedConnectedAddress;
 		}
 	}
 	else
 	{
-		// 
 		// Non-Connected socket
-		// 
 		
 		if (currentSend->resolveInProgress)
 		{
@@ -3652,40 +3639,58 @@ SetParamPtrsAndReturn:
 		}
 		else
 		{
-			NSData *addr = nil;
 			NSError *err = nil;
-			
-			int af = [self getAddress:&addr error:&err fromAddresses:currentSend->addresses];
+			af = [self getAddress:&addr error:&err fromAddresses:currentSend->addresses];
 			
 			if (err)
 			{
 				[self notifyDidNotSendDataWithTag:currentSend->tag dueToError:err];
 				done = YES;
 			}
-			else
-			{
-				const void *buffer = [currentSend->buffer bytes];
-				size_t length = (size_t)[currentSend->buffer length];
-				
-				const void *dst  = [addr bytes];
-				socklen_t dstSize = (socklen_t)[addr length];
-				
-				if (af == AF_INET)
-					result = sendto(socket4FD, buffer, length, 0, dst, dstSize);
-				else
-					result = sendto(socket6FD, buffer, length, 0, dst, dstSize);
-				
-				LogVerbose(@"send(socket%@FD) = %i (non-connected)", (af == AF_INET ? @"4" : @"6"), (int)result);
-				
-				checkResult = YES;
-			}
 		}
 	}
 	
-	NSError *error = nil;
+	// 2. Perform the send (if no problems)
 	
-	if (checkResult)
+	NSError *error = nil;
+	BOOL waitingForSocket = NO;
+	
+	if (!waitingForResolve && !done)
 	{
+		ssize_t result = 0;
+		
+		if (flags & kDidConnect)
+		{
+			// Connected socket
+			
+			const void *buffer = [currentSend->buffer bytes];
+			size_t length = (size_t)[currentSend->buffer length];
+			
+			if (socket4FD != SOCKET_NULL)
+				result = send(socket4FD, buffer, length, 0);
+			else
+				result = send(socket6FD, buffer, length, 0);
+				
+			LogVerbose(@"send(socket%@FD) = %i (connected)", (socket4FD != SOCKET_NULL ? @"4" : @"6"), (int)result);
+		}
+		else
+		{
+			// Non-Connected socket
+			
+			const void *buffer = [currentSend->buffer bytes];
+			size_t length = (size_t)[currentSend->buffer length];
+			
+			const void *dst  = [addr bytes];
+			socklen_t dstSize = (socklen_t)[addr length];
+			
+			if (af == AF_INET)
+				result = sendto(socket4FD, buffer, length, 0, dst, dstSize);
+			else
+				result = sendto(socket6FD, buffer, length, 0, dst, dstSize);
+			
+			LogVerbose(@"send(socket%@FD) = %i (non-connected)", (af == AF_INET ? @"4" : @"6"), (int)result);
+		}
+		
 		// If the socket wasn't bound before, it is now
 		
 		if ((flags & kDidBind) == 0)
@@ -3717,6 +3722,8 @@ SetParamPtrsAndReturn:
 			done = YES;
 		}
 	}
+	
+	// 3. Process results of 1 & 2
 	
 	if (waitingForResolve)
 	{
@@ -3764,7 +3771,6 @@ SetParamPtrsAndReturn:
 		sendTimer = NULL;
 	}
 	
-	[currentSend release];
 	currentSend = nil;
 }
 
@@ -3798,7 +3804,7 @@ SetParamPtrsAndReturn:
 			dispatch_release(theSendTimer);
 		});
 		
-		dispatch_time_t tt = dispatch_time(DISPATCH_TIME_NOW, (timeout * NSEC_PER_SEC));
+		dispatch_time_t tt = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(timeout * NSEC_PER_SEC));
 		
 		dispatch_source_set_timer(sendTimer, tt, DISPATCH_TIME_FOREVER, 0);
 		dispatch_resume(sendTimer);
@@ -3809,7 +3815,7 @@ SetParamPtrsAndReturn:
 #pragma mark Receiving
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-- (BOOL)beginReceiving:(NSError **)errPtr
+- (BOOL)receiveOnce:(NSError **)errPtr
 {
 	LogTrace();
 	
@@ -3818,18 +3824,19 @@ SetParamPtrsAndReturn:
 	
 	dispatch_block_t block = ^{
 		
-		if ((flags & kReceive) == 0)
+		if ((flags & kReceiveOnce) == 0)
 		{
 			if ((flags & kDidCreateSockets) == 0)
 			{
 				NSString *msg = @"Must bind socket before you can receive data. "
-								@"You can do this explicitly via bind, or implicitly via connect or by sending data.";
+				@"You can do this explicitly via bind, or implicitly via connect or by sending data.";
 				
-				err = [[self badConfigError:msg] retain];
+				err = [self badConfigError:msg];
 				return_from_block;
 			}
 			
-			flags |= kReceive;
+			flags |=  kReceiveOnce;       // Enable
+			flags &= ~kReceiveContinuous; // Disable
 			
 			dispatch_async(socketQueue, ^{ @autoreleasepool {
 				
@@ -3849,9 +3856,53 @@ SetParamPtrsAndReturn:
 		LogError(@"Error in beginReceiving: %@", err);
 	
 	if (errPtr)
-		*errPtr = [err autorelease];
+		*errPtr = err;
+	
+	return result;
+}
+
+- (BOOL)beginReceiving:(NSError **)errPtr
+{
+	LogTrace();
+	
+	__block BOOL result = NO;
+	__block NSError *err = nil;
+	
+	dispatch_block_t block = ^{
+		
+		if ((flags & kReceiveContinuous) == 0)
+		{
+			if ((flags & kDidCreateSockets) == 0)
+			{
+				NSString *msg = @"Must bind socket before you can receive data. "
+								@"You can do this explicitly via bind, or implicitly via connect or by sending data.";
+				
+				err = [self badConfigError:msg];
+				return_from_block;
+			}
+			
+			flags |= kReceiveContinuous; // Enable
+			flags &= ~kReceiveOnce;      // Disable
+			
+			dispatch_async(socketQueue, ^{ @autoreleasepool {
+				
+				[self doReceive];
+			}});
+		}
+		
+		result = YES;
+	};
+	
+	if (dispatch_get_current_queue() == socketQueue)
+		block();
 	else
-		[err release];
+		dispatch_sync(socketQueue, block);
+	
+	if (err)
+		LogError(@"Error in beginReceiving: %@", err);
+	
+	if (errPtr)
+		*errPtr = err;
 	
 	return result;
 }
@@ -3862,7 +3913,8 @@ SetParamPtrsAndReturn:
 	
 	dispatch_block_t block = ^{
 		
-		flags &= ~kReceive;
+		flags &= ~kReceiveOnce;       // Disable
+		flags &= ~kReceiveContinuous; // Disable
 		
 		if (socket4FDBytesAvailable > 0) {
 			[self suspendReceive4Source];
@@ -3878,35 +3930,35 @@ SetParamPtrsAndReturn:
 		dispatch_async(socketQueue, block);
 }
 
-- (void)setReceiveFilter:(GCDAsyncUdpSocketReceiveFilterBlock)inFilterBlock withQueue:(dispatch_queue_t)inFilterQueue
+- (void)setReceiveFilter:(GCDAsyncUdpSocketReceiveFilterBlock)filterBlock withQueue:(dispatch_queue_t)filterQueue
 {
-	GCDAsyncUdpSocketReceiveFilterBlock newFilterBlock;
-	dispatch_queue_t newFilterQueue;
+	[self setReceiveFilter:filterBlock withQueue:filterQueue isAsynchronous:YES];
+}
+
+- (void)setReceiveFilter:(GCDAsyncUdpSocketReceiveFilterBlock)filterBlock
+               withQueue:(dispatch_queue_t)filterQueue
+          isAsynchronous:(BOOL)isAsynchronous
+{
+	GCDAsyncUdpSocketReceiveFilterBlock newFilterBlock = NULL;
+	dispatch_queue_t newFilterQueue = NULL;
 	
-	if (inFilterBlock)
+	if (filterBlock)
 	{
-		NSAssert(inFilterQueue, @"Must provide a dispatch_queue in which to run the filter block.");
+		NSAssert(filterQueue, @"Must provide a dispatch_queue in which to run the filter block.");
 		
-		newFilterBlock = [inFilterBlock copy];
-		newFilterQueue = inFilterQueue;
+		newFilterBlock = [filterBlock copy];
+		newFilterQueue = filterQueue;
 		dispatch_retain(newFilterQueue);
-	}
-	else
-	{
-		newFilterBlock = NULL;
-		newFilterQueue = NULL;
 	}
 	
 	dispatch_block_t block = ^{
 		
-		if (filterBlock)
-			[filterBlock release];
+		if (receiveFilterQueue)
+			dispatch_release(receiveFilterQueue);
 		
-		if (filterQueue)
-			dispatch_release(filterQueue);
-		
-		filterBlock = newFilterBlock;
-		filterQueue = newFilterQueue;
+		receiveFilterBlock = newFilterBlock;
+		receiveFilterQueue = newFilterQueue;
+		receiveFilterAsync = isAsynchronous;
 	};
 	
 	if (dispatch_get_current_queue() == socketQueue)
@@ -3919,9 +3971,23 @@ SetParamPtrsAndReturn:
 {
 	LogTrace();
 	
-	if ((flags & kReceive) == 0)
+	if ((flags & (kReceiveOnce | kReceiveContinuous)) == 0)
 	{
 		LogVerbose(@"Receiving is paused...");
+		
+		if (socket4FDBytesAvailable > 0) {
+			[self suspendReceive4Source];
+		}
+		if (socket6FDBytesAvailable > 0) {
+			[self suspendReceive6Source];
+		}
+		
+		return;
+	}
+	
+	if ((flags & kReceiveOnce) && (pendingFilterOperations > 0))
+	{
+		LogVerbose(@"Receiving is temporarily paused (pending filter operations)...");
 		
 		if (socket4FDBytesAvailable > 0) {
 			[self suspendReceive4Source];
@@ -4006,12 +4072,12 @@ SetParamPtrsAndReturn:
 		
 		if (result > 0)
 		{
-			if (result >= socket4FDBytesAvailable)
+			if ((size_t)result >= socket4FDBytesAvailable)
 				socket4FDBytesAvailable = 0;
 			else
 				socket4FDBytesAvailable -= result;
 			
-			if (result != bufSize) {
+			if ((size_t)result != bufSize) {
 				buf = realloc(buf, result);
 			}
 			
@@ -4040,12 +4106,12 @@ SetParamPtrsAndReturn:
 		
 		if (result > 0)
 		{
-			if (result >= socket6FDBytesAvailable)
+			if ((size_t)result >= socket6FDBytesAvailable)
 				socket6FDBytesAvailable = 0;
 			else
 				socket6FDBytesAvailable -= result;
 			
-			if (result != bufSize) {
+			if ((size_t)result != bufSize) {
 				buf = realloc(buf, result);
 			}
 		
@@ -4061,6 +4127,9 @@ SetParamPtrsAndReturn:
 	
 	
 	BOOL waitingForSocket = NO;
+	BOOL notifiedDelegate = NO;
+	BOOL ignored = NO;
+	
 	NSError *error = nil;
 	
 	if (result == 0)
@@ -4076,8 +4145,6 @@ SetParamPtrsAndReturn:
 	}
 	else
 	{
-		BOOL ignored = NO;
-		
 		if (flags & kDidConnect)
 		{
 			if (addr4 && ![self isConnectedToAddress4:addr4])
@@ -4090,41 +4157,82 @@ SetParamPtrsAndReturn:
 		
 		if (!ignored)
 		{
-			if (filterBlock && filterQueue)
+			if (receiveFilterBlock && receiveFilterQueue)
 			{
 				// Run data through filter, and if approved, notify delegate
-				dispatch_async(filterQueue, ^{ @autoreleasepool {
-					
-					id filterContext = nil;
-					
-					if (filterBlock(data, addr, &filterContext))
-					{
+				
+				__block id filterContext = nil;
+				__block BOOL allowed = NO;
+				
+				if (receiveFilterAsync)
+				{
+					pendingFilterOperations++;
+					dispatch_async(receiveFilterQueue, ^{ @autoreleasepool {
+						
+						allowed = receiveFilterBlock(data, addr, &filterContext);
+						
 						// Transition back to socketQueue to get the current delegate / delegateQueue
-						dispatch_async(socketQueue, ^{
-							[self notifyDidReceiveData:data fromAddress:addr withFilterContext:filterContext];
-						});
-					}
+						dispatch_async(socketQueue, ^{ @autoreleasepool {
+							
+							pendingFilterOperations--;
+							
+							if (allowed)
+							{
+								[self notifyDidReceiveData:data fromAddress:addr withFilterContext:filterContext];
+							}
+							
+							if (flags & kReceiveOnce)
+							{
+								if (allowed)
+								{
+									// The delegate has been notified,
+									// so our receive once operation has completed.
+									flags &= ~kReceiveOnce;
+								}
+								else if (pendingFilterOperations == 0)
+								{
+									// All pending filter operations have completed,
+									// and none were allowed through.
+									// Our receive once operation hasn't completed yet.
+									[self doReceive];
+								}
+							}
+						}});
+					}});
+				}
+				else // if (!receiveFilterAsync)
+				{
+					dispatch_sync(receiveFilterQueue, ^{ @autoreleasepool {
+						
+						allowed = receiveFilterBlock(data, addr, &filterContext);
+					}});
 					
-				}});
+					if (allowed) {
+						[self notifyDidReceiveData:data fromAddress:addr withFilterContext:filterContext];
+						notifiedDelegate = YES;
+					}
+					else {
+						ignored = YES;
+					}
+				}
 			}
-			else
+			else // if (!receiveFilterBlock || !receiveFilterQueue)
 			{
-				// Notify delegate
 				[self notifyDidReceiveData:data fromAddress:addr withFilterContext:nil];
+				notifiedDelegate = YES;
 			}
 		}
 	}
 	
 	if (waitingForSocket)
 	{
-		// Not enough room in the underlying OS socket send buffer.
-		// Wait for a notification.
+		// Wait for a notification of available data.
 		
-		if (!(flags & kSock4CanAcceptBytes)) {
-			[self resumeSend4Source];
+		if (socket4FDBytesAvailable == 0) {
+			[self resumeReceive4Source];
 		}
-		if (!(flags & kSock6CanAcceptBytes)) {
-			[self resumeSend6Source];
+		if (socket6FDBytesAvailable == 0) {
+			[self resumeReceive6Source];
 		}
 	}
 	else if (error)
@@ -4133,7 +4241,29 @@ SetParamPtrsAndReturn:
 	}
 	else
 	{
-		[self doReceive];
+		if (flags & kReceiveContinuous)
+		{
+			// Continuous receive mode
+			[self doReceive];
+		}
+		else
+		{
+			// One-at-a-time receive mode
+			if (notifiedDelegate)
+			{
+				// The delegate has been notified (no set filter).
+				// So our receive once operation has completed.
+				flags &= ~kReceiveOnce;
+			}
+			else if (ignored)
+			{
+				[self doReceive];
+			}
+			else
+			{
+				// Waiting on asynchronous receive filter...
+			}
+		}
 	}
 }
 
@@ -4220,6 +4350,9 @@ SetParamPtrsAndReturn:
 
 static NSThread *listenerThread;
 
++ (void)ignore:(id)_
+{}
+
 + (void)startListenerThreadIfNeeded
 {
 	static dispatch_once_t predicate;
@@ -4297,7 +4430,7 @@ static NSThread *listenerThread;
 static void CFReadStreamCallback(CFReadStreamRef stream, CFStreamEventType type, void *pInfo)
 {
 	@autoreleasepool {
-		GCDAsyncUdpSocket *asyncUdpSocket = [(GCDAsyncUdpSocket *)pInfo retain];
+		GCDAsyncUdpSocket *asyncUdpSocket = (__bridge GCDAsyncUdpSocket *)pInfo;
 	
 		switch(type)
 		{
@@ -4314,10 +4447,10 @@ static void CFReadStreamCallback(CFReadStreamRef stream, CFStreamEventType type,
 			case kCFStreamEventErrorOccurred:
 			case kCFStreamEventEndEncountered:
 			{
-				NSError *error = NSMakeCollectable(CFReadStreamCopyError(stream));
+				NSError *error = (__bridge_transfer NSError *)CFReadStreamCopyError(stream);
 				if (error == nil && type == kCFStreamEventEndEncountered)
 				{
-					error = [[asyncUdpSocket socketClosedError] retain];
+					error = [asyncUdpSocket socketClosedError];
 				}
 				
 				dispatch_async(asyncUdpSocket->socketQueue, ^{ @autoreleasepool {
@@ -4336,7 +4469,6 @@ static void CFReadStreamCallback(CFReadStreamRef stream, CFStreamEventType type,
 					
 				}});
 				
-				[error release];
 				break;
 			}
 			default:
@@ -4344,15 +4476,13 @@ static void CFReadStreamCallback(CFReadStreamRef stream, CFStreamEventType type,
 				LogCError(@"CFReadStreamCallback - UnknownType: %i", (int)type);
 			}
 		}
-		
-		[asyncUdpSocket release];
 	}
 }
 
 static void CFWriteStreamCallback(CFWriteStreamRef stream, CFStreamEventType type, void *pInfo)
 {
 	@autoreleasepool {
-		GCDAsyncUdpSocket *asyncUdpSocket = [(GCDAsyncUdpSocket *)pInfo retain];
+		GCDAsyncUdpSocket *asyncUdpSocket = (__bridge GCDAsyncUdpSocket *)pInfo;
 		
 		switch(type)
 		{
@@ -4369,10 +4499,10 @@ static void CFWriteStreamCallback(CFWriteStreamRef stream, CFStreamEventType typ
 			case kCFStreamEventErrorOccurred:
 			case kCFStreamEventEndEncountered:
 			{
-				NSError *error = NSMakeCollectable(CFWriteStreamCopyError(stream));
+				NSError *error = (__bridge_transfer NSError *)CFWriteStreamCopyError(stream);
 				if (error == nil && type == kCFStreamEventEndEncountered)
 				{
-					error = [[asyncUdpSocket socketClosedError] retain];
+					error = [asyncUdpSocket socketClosedError];
 				}
 				
 				dispatch_async(asyncUdpSocket->socketQueue, ^{ @autoreleasepool {
@@ -4391,7 +4521,6 @@ static void CFWriteStreamCallback(CFWriteStreamRef stream, CFStreamEventType typ
 					
 				}});
 				
-				[error release];
 				break;
 			}
 			default:
@@ -4399,8 +4528,6 @@ static void CFWriteStreamCallback(CFWriteStreamRef stream, CFStreamEventType typ
 				LogCError(@"CFWriteStreamCallback - UnknownType: %i", (int)type);
 			}
 		}
-		
-		[asyncUdpSocket release];
 	}
 }
 
@@ -4499,7 +4626,7 @@ Failed:
 	NSError *err = nil;
 	
 	streamContext.version = 0;
-	streamContext.info = self;
+	streamContext.info = (__bridge void *)self;
 	streamContext.retain = nil;
 	streamContext.release = nil;
 	streamContext.copyDescription = nil;
@@ -4704,7 +4831,10 @@ Failed:
 
 - (void)performBlock:(dispatch_block_t)block
 {
-	dispatch_sync(socketQueue, block);
+	if (dispatch_get_current_queue() == socketQueue)
+		block();
+	else
+		dispatch_sync(socketQueue, block);
 }
 
 - (int)socketFD
@@ -4803,6 +4933,9 @@ Failed:
 		return NO;
 	}
 	
+	// Why is this commented out?
+	// See comments below.
+	
 //	NSError *err = nil;
 //	if (![self createReadAndWriteStreams:&err])
 //	{
@@ -4845,7 +4978,7 @@ Failed:
 	// 
 	// One tiny problem: the sockets will still get closed when the app gets backgrounded.
 	// 
-	// Edit: Actually I forgot to set the voip flag in the Info.plist, so I need to test this again...
+	// Apple does not officially support backgrounding UDP sockets.
 	
 	return NO;
 }

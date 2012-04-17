@@ -2,11 +2,16 @@
 #import "GCDAsyncSocket.h"
 #import "DDLog.h"
 #import "DDTTYLogger.h"
+#import "DispatchQueueLogFormatter.h"
 
 // Log levels: off, error, warn, info, verbose
 static const int ddLogLevel = LOG_LEVEL_VERBOSE;
 
+#define HOST @"google.com"
+
 #define USE_SECURE_CONNECTION    0
+#define VALIDATE_SSL_CERTIFICATE 1
+
 #define READ_HEADER_LINE_BY_LINE 0
 
 
@@ -35,6 +40,24 @@ static const int ddLogLevel = LOG_LEVEL_VERBOSE;
 	
 	[DDLog addLogger:[DDTTYLogger sharedInstance]];
 	
+	// We're going to take advantage of some of Lumberjack's advanced features.
+	//
+	// Format log statements such that it outputs the queue/thread name.
+	// As opposed to the not-so-helpful mach thread id.
+	// 
+	// Old : 2011-12-05 19:54:08:161 [17894:f803] Connecting...
+	//       2011-12-05 19:54:08:161 [17894:11f03] GCDAsyncSocket: Dispatching DNS lookup...
+	//       2011-12-05 19:54:08:161 [17894:13303] GCDAsyncSocket: Creating IPv4 socket
+	// 
+	// New : 2011-12-05 19:54:08:161 [main] Connecting...
+	//       2011-12-05 19:54:08:161 [socket] GCDAsyncSocket: Dispatching DNS lookup...
+	//       2011-12-05 19:54:08:161 [socket] GCDAsyncSocket: Creating IPv4 socket
+	
+	DispatchQueueLogFormatter *formatter = [[DispatchQueueLogFormatter alloc] init];
+	[formatter setReplacementString:@"socket" forQueueLabel:GCDAsyncSocketQueueName];
+	[formatter setReplacementString:@"socket-cf" forQueueLabel:GCDAsyncSocketThreadName];
+	
+	[[DDTTYLogger sharedInstance] setLogFormatter:formatter];
 	
 	// Create our GCDAsyncSocket instance.
 	// 
@@ -73,7 +96,7 @@ static const int ddLogLevel = LOG_LEVEL_VERBOSE;
 	uint16_t port = 80;  // HTTP
 #endif
 	
-	if (![asyncSocket connectToHost:@"deusty.com" onPort:port error:&error])
+	if (![asyncSocket connectToHost:HOST onPort:port error:&error])
 	{
 		DDLogError(@"Unable to connect to due to invalid configuration: %@", error);
 	}
@@ -99,13 +122,26 @@ static const int ddLogLevel = LOG_LEVEL_VERBOSE;
 	// There it will find, dequeue and execute our request to start the TLS security protocol.
 	// 
 	// The options passed to the startTLS method are fully documented in the GCDAsyncSocket header file.
-	// The deusty server only has a development (self-signed) X.509 certificate.
-	// So we tell it not to attempt to validate the cert (cause if it did it would fail).
 	
-	NSDictionary *options = [NSDictionary dictionaryWithObject:[NSNumber numberWithBool:NO]
-	                                                    forKey:(NSString *)kCFStreamSSLValidatesCertificateChain];
 	
-	[asyncSocket startTLS:options];
+	// Some servers only have a development (self-signed) X.509 certificate.
+	// In this case we could tell it not to attempt to validate the cert (cause if it did it would fail).
+	
+	#if VALIDATE_SSL_CERTIFICATE
+	{
+		DDLogVerbose(@"Requesting StartTLS with options: (nil)");
+		[asyncSocket startTLS:nil];
+	}
+	#else
+	{
+		NSDictionary *options =
+		[NSDictionary dictionaryWithObject:[NSNumber numberWithBool:NO]
+									forKey:(NSString *)kCFStreamSSLValidatesCertificateChain];
+		
+		DDLogVerbose(@"Requesting StartTLS with options:\n%@", options);
+		[asyncSocket startTLS:options];
+	}
+	#endif
 	
 #endif
 }
@@ -122,7 +158,9 @@ static const int ddLogLevel = LOG_LEVEL_VERBOSE;
 	// We're just going to tell the server to send us the metadata (essentially) about a particular resource.
 	// The server will send an http response, and then immediately close the connection.
 	
-	NSString *requestStr = @"HEAD / HTTP/1.0\r\nHost: deusty.com\r\nConnection: Close\r\n\r\n";
+	NSString *requestStrFrmt = @"HEAD / HTTP/1.0\r\nHost: %@\r\nConnection: Close\r\n\r\n";
+	
+	NSString *requestStr = [NSString stringWithFormat:requestStrFrmt, HOST];
 	NSData *requestData = [requestStr dataUsingEncoding:NSUTF8StringEncoding];
 	
 	[asyncSocket writeData:requestData withTimeout:-1.0 tag:0];
@@ -201,7 +239,6 @@ static const int ddLogLevel = LOG_LEVEL_VERBOSE;
 	
 #endif
 	
-	[httpResponse release];
 }
 
 - (void)socketDidDisconnect:(GCDAsyncSocket *)sock withError:(NSError *)err
